@@ -8,7 +8,7 @@
 
 #import "SAViewController.h"
 #import "TMAudioStreamingOperation.h"
-#import "TMAudioStreamingEngine.h"
+#import "TMAudioPlayer.h"
 
 @interface SAViewController ()
 
@@ -16,7 +16,7 @@
 
 @implementation SAViewController
 {
-    TMAudioStreamingEngine* _engine;
+    TMAudioPlayer*  _player;
 }
 
 - (void)viewDidLoad
@@ -24,15 +24,17 @@
     [super viewDidLoad];
 	// Do any additional setup after loading the view, typically from a nib.
     
+    if (_player == nil)
+    {
+        _player = [[TMAudioPlayer alloc] init];
+    }
+    
     NSURL* url = [NSURL URLWithString:@"http://ht.salemweb.net/ccm/tcm/album-tracks-clips/AnthemLights/AnthemLightsEP/01_CantShutUp.mp3"];
-    
-//    _engine = [[TMAudioStreamingEngine alloc] initWithURL:url];
-//    [_engine start];
-    
-    NSOperationQueue* queue = [[NSOperationQueue alloc] init];
-    
-    TMAudioStreamingOperation* operation = [[TMAudioStreamingOperation alloc] initWithURL:url];
-    [queue addOperation:operation];
+    [_player playAudioWithURL:url];
+//    NSOperationQueue* queue = [[NSOperationQueue alloc] init];
+//    
+//    TMAudioStreamingOperation* operation = [[TMAudioStreamingOperation alloc] initWithURL:url];
+//    [queue addOperation:operation];
 }
 
 - (void)didReceiveMemoryWarning

@@ -13,6 +13,8 @@
 
 @property(nonatomic) BOOL  completed;
 
+-(void)handleReadFromStream:(CFReadStreamRef)stream eventType:(CFStreamEventType)eventType;
+
 @end
 
 @implementation TMAudioStreamingOperation
@@ -154,7 +156,7 @@ static void readStreamCallBack(CFReadStreamRef aStream, CFStreamEventType eventT
             // 不读出来就不会继续
             length = CFReadStreamRead(stream, bytes, 2048);
             
-            
+            [self.delegate audioStreamingOperation:self didReadBytes:bytes length:length];
         }
             break;
         case kCFStreamEventEndEncountered:
