@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		612B109F170AE298003899D9 /* TMAudioPlayer.m in Sources */ = {isa = PBXBuildFile; fileRef = 612B109E170AE298003899D9 /* TMAudioPlayer.m */; };
 		A6500AC11706AF34001046F5 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A6500AC01706AF34001046F5 /* UIKit.framework */; };
 		A6500AC31706AF34001046F5 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A6500AC21706AF34001046F5 /* Foundation.framework */; };
 		A6500AC51706AF34001046F5 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A6500AC41706AF34001046F5 /* CoreGraphics.framework */; };
@@ -19,11 +20,12 @@
 		A6500ADA1706AF34001046F5 /* MainStoryboard.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = A6500AD81706AF34001046F5 /* MainStoryboard.storyboard */; };
 		A6500ADD1706AF34001046F5 /* SAViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = A6500ADC1706AF34001046F5 /* SAViewController.m */; };
 		A67B258B1709CD0600DCE2A8 /* TMAudioStreamingOperation.m in Sources */ = {isa = PBXBuildFile; fileRef = A67B258A1709CD0600DCE2A8 /* TMAudioStreamingOperation.m */; };
-		A67B258F1709CF7200DCE2A8 /* TMAudioStreamingEngine.m in Sources */ = {isa = PBXBuildFile; fileRef = A67B258E1709CF7200DCE2A8 /* TMAudioStreamingEngine.m */; };
 		A67B25911709E1EC00DCE2A8 /* CFNetwork.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A67B25901709E1EC00DCE2A8 /* CFNetwork.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		612B109D170AE298003899D9 /* TMAudioPlayer.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = TMAudioPlayer.h; sourceTree = "<group>"; };
+		612B109E170AE298003899D9 /* TMAudioPlayer.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = TMAudioPlayer.m; sourceTree = "<group>"; };
 		A6500ABC1706AF34001046F5 /* StreamingAudioPlayerFun.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = StreamingAudioPlayerFun.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A6500AC01706AF34001046F5 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
 		A6500AC21706AF34001046F5 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
@@ -42,8 +44,6 @@
 		A6500ADC1706AF34001046F5 /* SAViewController.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = SAViewController.m; sourceTree = "<group>"; };
 		A67B25891709CD0600DCE2A8 /* TMAudioStreamingOperation.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = TMAudioStreamingOperation.h; sourceTree = "<group>"; };
 		A67B258A1709CD0600DCE2A8 /* TMAudioStreamingOperation.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = TMAudioStreamingOperation.m; sourceTree = "<group>"; };
-		A67B258D1709CF7200DCE2A8 /* TMAudioStreamingEngine.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = TMAudioStreamingEngine.h; sourceTree = "<group>"; };
-		A67B258E1709CF7200DCE2A8 /* TMAudioStreamingEngine.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = TMAudioStreamingEngine.m; sourceTree = "<group>"; };
 		A67B25901709E1EC00DCE2A8 /* CFNetwork.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CFNetwork.framework; path = System/Library/Frameworks/CFNetwork.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
@@ -123,8 +123,8 @@
 			children = (
 				A67B25891709CD0600DCE2A8 /* TMAudioStreamingOperation.h */,
 				A67B258A1709CD0600DCE2A8 /* TMAudioStreamingOperation.m */,
-				A67B258D1709CF7200DCE2A8 /* TMAudioStreamingEngine.h */,
-				A67B258E1709CF7200DCE2A8 /* TMAudioStreamingEngine.m */,
+				612B109D170AE298003899D9 /* TMAudioPlayer.h */,
+				612B109E170AE298003899D9 /* TMAudioPlayer.m */,
 			);
 			name = StreamingAudioPlayer;
 			path = ../../StreamingAudioPlayer;
@@ -201,7 +201,7 @@
 				A6500AD11706AF34001046F5 /* SAAppDelegate.m in Sources */,
 				A6500ADD1706AF34001046F5 /* SAViewController.m in Sources */,
 				A67B258B1709CD0600DCE2A8 /* TMAudioStreamingOperation.m in Sources */,
-				A67B258F1709CF7200DCE2A8 /* TMAudioStreamingEngine.m in Sources */,
+				612B109F170AE298003899D9 /* TMAudioPlayer.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -26,13 +26,13 @@
     
     NSURL* url = [NSURL URLWithString:@"http://ht.salemweb.net/ccm/tcm/album-tracks-clips/AnthemLights/AnthemLightsEP/01_CantShutUp.mp3"];
     
-    _engine = [[TMAudioStreamingEngine alloc] initWithURL:url];
-    [_engine start];
+//    _engine = [[TMAudioStreamingEngine alloc] initWithURL:url];
+//    [_engine start];
     
-//    NSOperationQueue* queue = [NSOperationQueue mainQueue];
-//    
-//    TMAudioStreamingOperation* operation = [[TMAudioStreamingOperation alloc] initWithURL:url];
-//    [queue addOperation:operation];
+    NSOperationQueue* queue = [[NSOperationQueue alloc] init];
+    
+    TMAudioStreamingOperation* operation = [[TMAudioStreamingOperation alloc] initWithURL:url];
+    [queue addOperation:operation];
 }
 
 - (void)didReceiveMemoryWarning
