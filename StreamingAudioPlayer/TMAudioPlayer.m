@@ -9,6 +9,7 @@
 #import "TMAudioPlayer.h"
 #import "TMAudioStreamingOperation.h"
 #include <AudioToolbox/AudioToolbox.h>
+#include <pthread.h>
 
 // Number of audio queue buffers we allocate.
 // Needs to be big enough to keep audio pipeline
@@ -37,61 +38,63 @@
 // Number of packet descriptions in our array
 #define kAQMaxPacketDescs 512
 
-#define BitRateEstimationMaxPackets 5000
 #define BitRateEstimationMinPackets 50
+
+enum {
+    TMAudioPlayerStatusIdle = 0,
+    TMAudioPlayerStatusBuffering,
+    TMAudioPlayerStatusPlaying,
+    TMAudioPlayerStatusPaused
+};
+typedef NSUInteger TMAudioPlayerStatus;
 
 @interface TMAudioPlayer () <TMAudioStreamingOperationDelegate>
 
-- (void)handleInterruptionChangeToState:(AudioQueuePropertyID)inInterruptionState;
+/**
+ 暂停播放
+ 
+ 用于在遇到电话、其他音乐播放等中断时内部使用，中断解除后将继续播放
+ */
+-(void)pause;
 
--(void)handleAudioStreamPackets:(const void*)inInputData
-                    numberBytes:(UInt32)inNumberBytes
-                  numberPackets:(UInt32)inNumberPackets
-             packetDescriptions:(AudioStreamPacketDescription *)inPacketDescriptions;
-
-- (void)handlePropertyChangeForFileStream:(AudioFileStreamID)inAudioFileStream
-                     fileStreamPropertyID:(AudioFileStreamPropertyID)inPropertyID
-                                  ioFlags:(UInt32 *)ioFlags;
-
-- (void)handleBufferCompleteForQueue:(AudioQueueRef)inAQ
-                              buffer:(AudioQueueBufferRef)inBuffer;
-
-- (void)handlePropertyChangeForQueue:(AudioQueueRef)inAQ
-                          propertyID:(AudioQueuePropertyID)inID;
+/**
+ 暂停后的恢复播放
+ */
+-(void)resume;
 
 @end
 
 @implementation TMAudioPlayer
 {
     // operation
-    NSOperationQueue*   _operationQueue;
+    NSOperationQueue*            _operationQueue;
     
     // url
-    NSURL*              _audioURL;
+    NSURL*                       _audioURL;
+    
+    // Audio Queue
+    AudioQueueRef                _audioQueue; // 音频数据管理队列
     
     // Audio stream
-    AudioQueueRef                _audioQueue;
-    AudioQueueBufferRef          _audioQueueBuffer[kNumAQBufs];
+	AudioFileStreamID            _audioStream; // 音频流句柄
+    AudioStreamBasicDescription  _audioStremDescription; // 音频的一些属性描述
     
-	AudioFileStreamID            _audioStream;
-    AudioStreamBasicDescription  _audioStremDescription;
+    // packet相关
+    AudioStreamPacketDescription _packetDescs[kAQMaxPacketDescs]; // 数据包信息数组
+    size_t                       _packetsFilled; // enqueue之前记录包的数量，每次enqueue完后清零
     
-    AudioStreamPacketDescription _packetDescs[kAQMaxPacketDescs];
-    
+    // buffer相关变量
+    AudioQueueBufferRef          _audioQueueBuffer[kNumAQBufs]; // 音频队列中的buffer数组，buffer被作为一个循环队列填充/使用(播放)数据
     UInt32                       _packetBufferSize;
-    UInt64                       _processedPacketsCount;		// number of packets accumulated for bitrate estimation
-	UInt64                       _processedPacketsSizeTotal;	// byte size of accumulated estimation packets
     size_t                       _bytesFilled;
-    unsigned int                 _fillBufferIndex;
-    size_t                       _packetsFilled;
-    NSInteger                    _dataOffset;
-    NSInteger _fileLength;		// Length of the file in bytes
-	NSInteger _seekByteOffset;	// Seek offset within the file in bytes
-	UInt64 _audioDataByteCount;
+    unsigned int                 _fillBufferIndex; // 当前正在填充的buffer索引
+    pthread_mutex_t              _queueBuffersMutex; // 保护正在使用中buffer的互斥锁
+	pthread_cond_t               _queueBufferReadyCondition; // 条件变量，用于等待buffer状态变为可用
+    bool                         _inuse[kNumAQBufs]; // 每个buffer的状态记录数组
+    NSInteger                    _buffersUsed; // 使用中的buffer个数
     
     BOOL                         _discontinuous;
-    bool                         _inuse[kNumAQBufs];
-    NSInteger                    _buffersUsed;
+    TMAudioPlayerStatus          _status;
 }
 
 -(id)init
@@ -108,7 +111,7 @@
 
 -(void)dealloc
 {
-    [self cleanupAudioStreamer];
+    [self cleanupAudioStream];
 }
 
 #pragma mark - Interface
@@ -119,24 +122,97 @@
     
     _audioURL = audioURL;
     
-    [self cleanupAudioStreamer];
+    // 0. cleanup audio stream
+    [self cleanupAudioStream];
+    
+    // 1. initialize audio session
     [self initializeAudioSession];
     
-    // queue
-    TMAudioStreamingOperation* streamer = [[TMAudioStreamingOperation alloc] initWithURL:audioURL];
-    streamer.delegate = self;
+    // 2. start audio downloading
+    TMAudioStreamingOperation* streamOperation = [[TMAudioStreamingOperation alloc] initWithURL:audioURL];
+    streamOperation.delegate = self;
     
-    [_operationQueue addOperation:streamer];
+    [_operationQueue addOperation:streamOperation];
+    
+    // 3. create audio stream and queue in the streamer call back function
+}
+
+-(void)stop
+{
+    [self cleanupAudioStream];
+    
+}
+
+-(void)pause
+{
+    @synchronized(self)
+    {
+        _status = TMAudioPlayerStatusPaused;
+        AudioQueuePause(_audioQueue);
+    }
+}
+
+-(void)resume
+{
+    @synchronized(self)
+    {
+        _status = TMAudioPlayerStatusPlaying;
+        AudioSessionSetActive(true);
+        AudioQueueStart(_audioQueue, NULL);
+    }
 }
 
 #pragma mark - Internal methods
--(void)cleanupAudioStreamer
+-(void)cleanupAudioStream
 {
-    for (TMAudioStreamingOperation* operation in _operationQueue.operations)
+    @synchronized(self)
     {
-        operation.delegate = nil;
-        [operation cancel];
+        for (TMAudioStreamingOperation* operation in _operationQueue.operations)
+        {
+            operation.delegate = nil;
+            [operation cancel];
+        }
+        
+        // cleanup audio queue
+        if (_audioStream)
+        {
+            AudioFileStreamClose(_audioStream);
+            _audioStream = nil;
+        }
+        
+        // cleanup audio queue
+        if (_audioQueue)
+        {
+            AudioQueueDispose(_audioQueue, true);
+            _audioQueue = nil;
+        }
+        
+        // 释放锁
+        pthread_mutex_destroy(&_queueBuffersMutex);
+        pthread_cond_destroy(&_queueBufferReadyCondition);
+        
+        // cleanup audio session
+        AudioSessionSetActive(false);
+        
+        // reset iVars
+        _status = TMAudioPlayerStatusIdle;
     }
+}
+
+-(void)initializeAudioSession
+{
+    AudioSessionInitialize(NULL,                          // 'NULL' to use the default (main) run loop
+                            NULL,                          // 'NULL' to use the default run loop mode
+                            tm_AudioSessionInterruptionListener, (__bridge void *)(self));
+    
+    UInt32 sessionCategory = kAudioSessionCategory_MediaPlayback;
+    AudioSessionSetProperty(kAudioSessionProperty_AudioCategory, sizeof(sessionCategory), &sessionCategory);
+    
+    AudioSessionSetActive(true);
+    
+    // initialize a mutex and condition so that we can block on buffers in use.
+    pthread_mutex_init(&_queueBuffersMutex, NULL);
+    pthread_cond_init(&_queueBufferReadyCondition, NULL);
 }
 
 -(void)setupAudioQueue
@@ -144,10 +220,10 @@
     if (_audioQueue == nil)
     {
         // create queue
-        AudioQueueNewOutput(&_audioStremDescription, ASAudioQueueOutputCallback, (__bridge void *)(self), NULL, NULL, 0, &_audioQueue);
+        AudioQueueNewOutput(&_audioStremDescription, tm_AudioQueueOutputCallback, (__bridge void *)(self), NULL, NULL, 0, &_audioQueue);
         
-        // listen the "isRunning" property
-        AudioQueueAddPropertyListener(_audioQueue, kAudioQueueProperty_IsRunning, ASAudioQueueIsRunningCallback, (__bridge void *)(self));
+        // listening the "isRunning" property
+        AudioQueueAddPropertyListener(_audioQueue, kAudioQueueProperty_IsRunning, tm_AudioQueueIsRunningCallback, (__bridge void *)(self));
         
         // get the packet size if it is available
         UInt32 sizeOfUInt32 = sizeof(UInt32);
@@ -201,39 +277,17 @@
 {
     if (_audioStream == nil)
     {
-        AudioFileStreamOpen((__bridge void *)(self), ASPropertyListenerProc, ASPacketsProc, kAudioFileMP3Type, &_audioStream);
+        AudioFileStreamOpen((__bridge void *)(self), tm_AudioStreamPropertyListenerProc, tm_AudioStreamPacketsProc, kAudioFileMP3Type, &_audioStream);
         
         
     }
 }
 
--(void)initializeAudioSession
-{
-    AudioSessionInitialize (
-                            NULL,                          // 'NULL' to use the default (main) run loop
-                            NULL,                          // 'NULL' to use the default run loop mode
-                            ASAudioSessionInterruptionListener,  // a reference to your interruption callback
-                            (__bridge void *)(self)                       // data to pass to your interruption listener callback
-                            );
-    UInt32 sessionCategory = kAudioSessionCategory_MediaPlayback;
-    AudioSessionSetProperty (
-                             kAudioSessionProperty_AudioCategory,
-                             sizeof (sessionCategory),
-                             &sessionCategory
-                             );
-    AudioSessionSetActive(true);
-}
-
-#pragma mark - Tools
+#pragma mark - Enqueue Buffer
 - (void)enqueueBuffer
 {
 	@synchronized(self)
 	{
-//		if ([self isFinishing] || stream == 0)
-//		{
-//			return;
-//		}
-		
 		_inuse[_fillBufferIndex] = true;		// set in use flag
 		_buffersUsed++;
         
@@ -249,49 +303,12 @@
 		{
 			AudioQueueEnqueueBuffer(_audioQueue, fillBuf, 0, NULL);
 		}
-		
-//		if (err)
-//		{
-//			[self failWithErrorCode:AS_AUDIO_QUEUE_ENQUEUE_FAILED];
-//			return;
-//		}
         
-		
-//		if (state == AS_BUFFERING ||
-//			state == AS_WAITING_FOR_DATA ||
-//			state == AS_FLUSHING_EOF ||
-//			(state == AS_STOPPED && stopReason == AS_STOPPING_TEMPORARILY))
-//		{
-//			//
-//			// Fill all the buffers before starting. This ensures that the
-//			// AudioFileStream stays a small amount ahead of the AudioQueue to
-//			// avoid an audio glitch playing streaming files on iPhone SDKs < 3.0
-//			//
-//			if (state == AS_FLUSHING_EOF || buffersUsed == kNumAQBufs - 1)
-//			{
-//				if (self.state == AS_BUFFERING)
-//				{
-//					err = AudioQueueStart(audioQueue, NULL);
-//					if (err)
-//					{
-//						[self failWithErrorCode:AS_AUDIO_QUEUE_START_FAILED];
-//						return;
-//					}
-//					self.state = AS_PLAYING;
-//				}
-//				else
-//				{
-//					self.state = AS_WAITING_FOR_QUEUE_TO_START;
-//                    
-					AudioQueueStart(_audioQueue, NULL);
-//					if (err)
-//					{
-//						[self failWithErrorCode:AS_AUDIO_QUEUE_START_FAILED];
-//						return;
-//					}
-//				}
-//			}
-//		}
+        // start queue
+        if (_status != TMAudioPlayerStatusPaused)
+        {
+            AudioQueueStart(_audioQueue, NULL);
+        }
         
 		// go to next buffer
 		if (++_fillBufferIndex >= kNumAQBufs)
@@ -304,16 +321,16 @@
 	}
     
 	// wait until next buffer is not in use
-//	pthread_mutex_lock(&queueBuffersMutex);
-//	while (inuse[fillBufferIndex])
-//	{
-//		pthread_cond_wait(&queueBufferReadyCondition, &queueBuffersMutex);
-//	}
-//	pthread_mutex_unlock(&queueBuffersMutex);
+	pthread_mutex_lock(&_queueBuffersMutex);
+	while (_inuse[_fillBufferIndex])
+	{
+		pthread_cond_wait(&_queueBufferReadyCondition, &_queueBuffersMutex);
+	}
+	pthread_mutex_unlock(&_queueBuffersMutex);
 }
 
-#pragma mark - Audio stream callbacks
-static void ASAudioSessionInterruptionListener(void *inClientData, UInt32 inInterruptionState)
+#pragma mark - Audio Session Callbacks
+static void tm_AudioSessionInterruptionListener(void *inClientData, UInt32 inInterruptionState)
 {
 	TMAudioPlayer* player = (__bridge TMAudioPlayer *)inClientData;
 	[player handleInterruptionChangeToState:inInterruptionState];
@@ -321,27 +338,21 @@ static void ASAudioSessionInterruptionListener(void *inClientData, UInt32 inInte
 
 - (void)handleInterruptionChangeToState:(AudioQueuePropertyID)inInterruptionState
 {
-	if (inInterruptionState == kAudioSessionBeginInterruption)
-	{
-//		if ([self isPlaying]) {
-//			[self pause];
-//			
-//			pausedByInterruption = YES;
-//		}
-	}
-	else if (inInterruptionState == kAudioSessionEndInterruption)
-	{
-		AudioSessionSetActive( true );
-		
-//		if ([self isPaused] && pausedByInterruption) {
-//			[self pause]; // this is actually resume
-//			
-//			pausedByInterruption = NO; // this is redundant
-//		}
-	}
+    @synchronized(self)
+    {
+        if (inInterruptionState == kAudioSessionBeginInterruption)
+        {
+            [self pause];
+        }
+        else if (inInterruptionState == kAudioSessionEndInterruption)
+        {
+            [self resume];
+        }
+    }
 }
 
-static void ASPropertyListenerProc(void* inClientData,
+#pragma mark - Audio Stream Callbacks
+static void tm_AudioStreamPropertyListenerProc(void* inClientData,
                                    AudioFileStreamID inAudioFileStream,
                                    AudioFileStreamPropertyID inPropertyID,
                                    UInt32* ioFlags)
@@ -354,6 +365,8 @@ static void ASPropertyListenerProc(void* inClientData,
                      fileStreamPropertyID:(AudioFileStreamPropertyID)inPropertyID
                                   ioFlags:(UInt32 *)ioFlags
 {
+    @synchronized(self)
+    {
     switch (inPropertyID)
     {
         case kAudioFileStreamProperty_ReadyToProducePackets:
@@ -366,29 +379,10 @@ static void ASPropertyListenerProc(void* inClientData,
             SInt64 offset;
 			UInt32 offsetSize = sizeof(offset);
 			AudioFileStreamGetProperty(inAudioFileStream, kAudioFileStreamProperty_DataOffset, &offsetSize, &offset);
-//			if (err)
-//			{
-//				[self failWithErrorCode:AS_FILE_STREAM_GET_PROPERTY_FAILED];
-//				return;
-//			}
-			_dataOffset = offset;
-			
-			if (_audioDataByteCount)
-			{
-				_fileLength = _dataOffset + _audioDataByteCount;
-			}
         }
             break;
         case kAudioFileStreamProperty_AudioDataByteCount:
         {
-            UInt32 byteCountSize = sizeof(UInt64);
-			AudioFileStreamGetProperty(inAudioFileStream, kAudioFileStreamProperty_AudioDataByteCount, &byteCountSize, &_audioDataByteCount);
-//			if (err)
-//			{
-//				[self failWithErrorCode:AS_FILE_STREAM_GET_PROPERTY_FAILED];
-//				return;
-//			}
-			_fileLength = _dataOffset + _audioDataByteCount;
         }
             break;
         case kAudioFileStreamProperty_DataFormat:
@@ -407,20 +401,9 @@ static void ASPropertyListenerProc(void* inClientData,
             Boolean outWriteable;
 			UInt32 formatListSize;
 			AudioFileStreamGetPropertyInfo(inAudioFileStream, kAudioFileStreamProperty_FormatList, &formatListSize, &outWriteable);
-//			if (err)
-//			{
-//				[self failWithErrorCode:AS_FILE_STREAM_GET_PROPERTY_FAILED];
-//				return;
-//			}
 			
 			AudioFormatListItem *formatList = malloc(formatListSize);
 	        AudioFileStreamGetProperty(inAudioFileStream, kAudioFileStreamProperty_FormatList, &formatListSize, formatList);
-//			if (err)
-//			{
-//				free(formatList);
-//				[self failWithErrorCode:AS_FILE_STREAM_GET_PROPERTY_FAILED];
-//				return;
-//			}
             
 			for (int i = 0; i * sizeof(AudioFormatListItem) < formatListSize; i += sizeof(AudioFormatListItem))
 			{
@@ -433,9 +416,7 @@ static void ASPropertyListenerProc(void* inClientData,
 					// We've found HE-AAC, remember this to tell the audio queue
 					// when we construct it.
 					//
-#if !TARGET_IPHONE_SIMULATOR
 					_audioStremDescription = pasbd;
-#endif
 					break;
 				}
 			}
@@ -445,9 +426,10 @@ static void ASPropertyListenerProc(void* inClientData,
         default:
             break;
     }
+    }
 }
 
-static void ASPacketsProc(void* inClientData,
+static void tm_AudioStreamPacketsProc(void* inClientData,
                           UInt32 inNumberBytes,
                           UInt32 inNumberPackets,
                           const void* inInputData,
@@ -479,13 +461,7 @@ static void ASPacketsProc(void* inClientData,
 			SInt64 packetOffset = inPacketDescriptions[i].mStartOffset;
 			SInt64 packetSize   = inPacketDescriptions[i].mDataByteSize;
 			size_t bufSpaceRemaining;
-			
-			if (_processedPacketsCount < BitRateEstimationMaxPackets)
-			{
-				_processedPacketsSizeTotal += packetSize;
-				_processedPacketsCount += 1;
-			}
-			
+			 
 			@synchronized(self)
 			{
 				// If the audio was terminated before this point, then
@@ -602,8 +578,8 @@ static void ASPacketsProc(void* inClientData,
     }
 }
 
-#pragma mark Audio Queue callbacks
-static void ASAudioQueueOutputCallback(void* inClientData,
+#pragma mark Audio Queue Callbacks
+static void tm_AudioQueueOutputCallback(void* inClientData,
                                        AudioQueueRef inAQ,
                                        AudioQueueBufferRef inBuffer)
 {
@@ -625,48 +601,63 @@ static void ASAudioQueueOutputCallback(void* inClientData,
 	
 	if (bufIndex == -1)
 	{
-//		[self failWithErrorCode:AS_AUDIO_QUEUE_BUFFER_MISMATCH];
-//		pthread_mutex_lock(&queueBuffersMutex);
-//		pthread_cond_signal(&queueBufferReadyCondition);
-//		pthread_mutex_unlock(&queueBuffersMutex);
+		pthread_mutex_lock(&_queueBuffersMutex);
+		pthread_cond_signal(&_queueBufferReadyCondition);
+		pthread_mutex_unlock(&_queueBuffersMutex);
 		return;
 	}
 
 	// signal waiting thread that the buffer is free.
-//	pthread_mutex_lock(&queueBuffersMutex);
+	pthread_mutex_lock(&_queueBuffersMutex);
 	_inuse[bufIndex] = false;
 	_buffersUsed--;
+    
+    pthread_cond_signal(&_queueBufferReadyCondition);
+	pthread_mutex_unlock(&_queueBuffersMutex);
 }
 
-static void ASAudioQueueIsRunningCallback(void *inUserData, AudioQueueRef inAQ, AudioQueuePropertyID inID)
+static void tm_AudioQueueIsRunningCallback(void *inUserData, AudioQueueRef inAQ, AudioQueuePropertyID inID)
 {
     TMAudioPlayer* player = (__bridge TMAudioPlayer*)inUserData;
-    [player handlePropertyChangeForQueue:inAQ propertyID:inID];
+    [player handleQueuePropertyChangeForQueue:inAQ propertyID:inID];
 }
 
-- (void)handlePropertyChangeForQueue:(AudioQueueRef)inAQ
-                          propertyID:(AudioQueuePropertyID)inID
+- (void)handleQueuePropertyChangeForQueue:(AudioQueueRef)inAQ
+                               propertyID:(AudioQueuePropertyID)inID
 {
 
 }
 
 #pragma mark - TMAudioStreamingOperationDelegate
+-(BOOL)shouldAudioStreamingOperationContinueReading:(TMAudioStreamingOperation *)aso
+{
+    return (_status != TMAudioPlayerStatusPaused);
+}
+
 -(void)audioStreamingOperation:(TMAudioStreamingOperation *)aso didReadBytes:(unsigned char*)bytes length:(long long)length
 {
     if (length <= 0) return;
     
-    [self setupAudioQueue];
-    [self setupAudioStream];
-    
-    // play
-    if (_discontinuous)
+    @synchronized(self)
     {
-        AudioFileStreamParseBytes(_audioStream, length, bytes, kAudioFileStreamParseFlag_Discontinuity);
+        // setup audio stream if necessary
+        [self setupAudioStream];
+        
+        //解析字节流，解析完成的数据将调用AudioFileStream_PacketsProc回调
+        if (_discontinuous)
+        {
+            AudioFileStreamParseBytes(_audioStream, length, bytes, kAudioFileStreamParseFlag_Discontinuity);
+        }
+        else
+        {
+            AudioFileStreamParseBytes(_audioStream, length, bytes, 0);
+        }
     }
-    else
-    {
-        AudioFileStreamParseBytes(_audioStream, length, bytes, 0);
-    }
+}
+
+-(void)audioStreamingOperation:(TMAudioStreamingOperation *)aso failedWithError:(long)errorCode
+{
+    [self stop];
 }
 
 @end
