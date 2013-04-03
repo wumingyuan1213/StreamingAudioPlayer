@@ -50,18 +50,6 @@ typedef NSUInteger TMAudioPlayerStatus;
 
 @interface TMAudioPlayer () <TMAudioStreamingOperationDelegate>
 
-/**
- 暂停播放
- 
- 用于在遇到电话、其他音乐播放等中断时内部使用，中断解除后将继续播放
- */
--(void)pause;
-
-/**
- 暂停后的恢复播放
- */
--(void)resume;
-
 @end
 
 @implementation TMAudioPlayer
@@ -141,6 +129,7 @@ typedef NSUInteger TMAudioPlayerStatus;
 {
     [self cleanupAudioStream];
     
+    [self.delegate audioPlayerDidChangeStatus:self];
 }
 
 -(void)pause
@@ -149,6 +138,8 @@ typedef NSUInteger TMAudioPlayerStatus;
     {
         _status = TMAudioPlayerStatusPaused;
         AudioQueuePause(_audioQueue);
+        
+        [self.delegate audioPlayerDidChangeStatus:self];
     }
 }
 
@@ -159,7 +150,19 @@ typedef NSUInteger TMAudioPlayerStatus;
         _status = TMAudioPlayerStatusPlaying;
         AudioSessionSetActive(true);
         AudioQueueStart(_audioQueue, NULL);
+        
+        [self.delegate audioPlayerDidChangeStatus:self];
     }
+}
+
+-(BOOL)isPlaying
+{
+    return (_status == TMAudioPlayerStatusPlaying);
+}
+
+-(BOOL)isPaused
+{
+    return (_status == TMAudioPlayerStatusPaused);
 }
 
 #pragma mark - Internal methods
