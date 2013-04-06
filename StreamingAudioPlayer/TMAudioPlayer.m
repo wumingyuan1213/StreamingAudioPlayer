@@ -178,7 +178,7 @@ typedef NSUInteger TMAudioPlayerStatus;
         if (AudioQueueStart(_audioQueue, NULL))
         {
             // start audio queue error
-            [self failedWithErrorCode:1];
+//            [self failedWithErrorCode:1];
             return;
         }
         
@@ -243,6 +243,8 @@ typedef NSUInteger TMAudioPlayerStatus;
             [self failedWithErrorCode:1];
             return;
         }
+        
+        _audioSessionInitialized = YES;
         
         UInt32 sessionCategory = kAudioSessionCategory_MediaPlayback;
         AudioSessionSetProperty(kAudioSessionProperty_AudioCategory, sizeof(sessionCategory), &sessionCategory);
@@ -341,7 +343,8 @@ typedef NSUInteger TMAudioPlayerStatus;
         {
             if (AudioQueueStart(_audioQueue, NULL))
             {
-                [self failedWithErrorCode:1];
+                // 多次调用打开会返回错误码
+//                [self failedWithErrorCode:1];
                 return;
             }
         }
