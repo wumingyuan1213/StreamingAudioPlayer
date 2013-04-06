@@ -8,6 +8,14 @@
 
 #import <Foundation/Foundation.h>
 
+// 错误类型定义
+enum {
+    TMAudioplayerError_None = 0,
+    TMAudioplayerError_Network,
+    TMAudioplayerError_AudioStream
+};
+typedef NSInteger TMAudioplayerError;
+
 /**
  用于音乐播放，这里包含播放以及下载
  */
@@ -67,5 +75,13 @@
  @param audioPlayer 播放音乐的TMAudioPlayer对象
  */
 -(void)audioPlayerDidChangeStatus:(TMAudioPlayer*)audioPlayer;
+
+/**
+ 播放器出现错误
+ 
+ @param audioPlayer 播放音乐的TMAudioPlayer对象
+ @param error 对应的错误信息
+ */
+-(void)audioPlayer:(TMAudioPlayer *)audioPlayer failedWithError:(NSError*)error;
 
 @end

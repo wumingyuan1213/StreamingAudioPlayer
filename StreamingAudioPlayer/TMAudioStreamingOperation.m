@@ -13,6 +13,8 @@
 
 @property(nonatomic) BOOL  completed;
 
+-(void)handleReadFromStream:(CFReadStreamRef)stream eventType:(CFStreamEventType)eventType;
+
 @end
 
 @implementation TMAudioStreamingOperation
@@ -134,14 +136,9 @@
     CFRelease(message);
     
     // enable redirection
-    if (CFReadStreamSetProperty(_stream,
+    CFReadStreamSetProperty(_stream,
                                 kCFStreamPropertyHTTPShouldAutoredirect,
-                                kCFBooleanTrue) == false)
-    {
-        // set property failed
-        NSLog(@"Set property failed.");
-        return NO;
-    }
+                                kCFBooleanTrue);
     
     // proxy
     CFDictionaryRef proxySettings = CFNetworkCopySystemProxySettings();
@@ -155,6 +152,9 @@
         _stream = nil;
         
         NSLog(@"Open stream failed.");
+        
+        [self.delegate audioStreamingOperation:self failedWithError:[NSError errorWithDomain:@"come.tencent" code:1 userInfo:nil]];
+        
         return NO;
     }
     
@@ -203,9 +203,12 @@ static void readStreamCallBack(CFReadStreamRef aStream, CFStreamEventType eventT
         case kCFStreamEventEndEncountered:
         {
             NSLog(@"stream event end.");
-            _completed = YES;
+            
+            [self.delegate audioStreamingOperationDidFinish:self];
             
             [self cleanup];
+            
+            _completed = YES;
         }
             break;
         case kCFStreamEventErrorOccurred:
@@ -221,7 +224,7 @@ static void readStreamCallBack(CFReadStreamRef aStream, CFStreamEventType eventT
             
             [self cleanup];
             
-            [self.delegate audioStreamingOperation:self failedWithError:error.error];
+            [self.delegate audioStreamingOperation:self failedWithError:[NSError errorWithDomain:@"com.tencent.weibo" code:error.error userInfo:nil]];
         }
             break;
         default:
