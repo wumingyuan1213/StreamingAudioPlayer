@@ -29,8 +29,9 @@ typedef NSInteger TMAudioplayerError;
  播放URL对应的音乐
  
  @param audioURL 将要播放的音乐对应URL
+ @return YES 表示可以播放， NO 不能播放
  */
--(void)playAudioWithURL:(NSURL*)audioURL;
+-(BOOL)playAudioWithURL:(NSURL*)audioURL;
 
 /**
  停止播放

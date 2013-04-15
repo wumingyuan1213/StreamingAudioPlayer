@@ -8,8 +8,6 @@
 
 #import <Foundation/Foundation.h>
 
-
-
 /**
  音频流式下载的operation类
  */
@@ -28,7 +26,9 @@
 
 @end
 
-
+/**
+ 音频流式下载委托协议
+ */
 @protocol TMAudioStreamingOperationDelegate <NSObject>
 
 @required
@@ -65,5 +65,12 @@
  @param aso TMAudioStreamingOperation对象
  */
 -(void)audioStreamingOperationDidFinish:(TMAudioStreamingOperation*)aso;
+
+@optional
+
+/**
+ 获取每次读取数据的长度
+ */
+-(long)audioStreamingOperationRequestEachPacketLength:(TMAudioStreamingOperation*)aso;
 
 @end

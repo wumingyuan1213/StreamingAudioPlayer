@@ -8,6 +8,9 @@
 
 #import "TMAudioStreamingOperation.h"
 #import <CFNetwork/CFNetwork.h>
+#import <sys/errno.h>
+
+#define kDefaultReadLength 2048
 
 @interface TMAudioStreamingOperation()
 
@@ -40,7 +43,7 @@
 
 -(void)dealloc
 {
-    NSLog(@"dealloc() in operation.");
+    TMNSLogInfo(@"dealloc() in operation.");
     [self cleanup];
 }
 
@@ -60,7 +63,10 @@
 #pragma mark - Operation methods override
 -(void)start
 {
-    if ([self isCancelled]) return;
+    if ([self isCancelled])
+    {
+        goto finished;
+    }
     
     [self willChangeValueForKey:@"isExecuting"];
     [self willChangeValueForKey:@"isFinished"];
@@ -79,6 +85,7 @@
         }
     }
     
+finished:
     [self willChangeValueForKey:@"isExecuting"];
     [self willChangeValueForKey:@"isFinished"];
     _tm_isExecuting = NO;
@@ -151,7 +158,7 @@
         CFRelease(_stream);
         _stream = nil;
         
-        NSLog(@"Open stream failed.");
+        TMNSLogError(@"Audio player CFReadStreamOpen failed.");
         
         [self.delegate audioStreamingOperation:self failedWithError:[NSError errorWithDomain:@"come.tencent" code:1 userInfo:nil]];
         
@@ -190,11 +197,18 @@ static void readStreamCallBack(CFReadStreamRef aStream, CFStreamEventType eventT
             // 可以继续读的情况下才继续读
             if ([self.delegate shouldAudioStreamingOperationContinueReading:self])
             {
-                UInt8 bytes[2048];
+                // 每次读取数据的大小
+                long expectLength = kDefaultReadLength;
+                if ([self.delegate respondsToSelector:@selector(audioStreamingOperationRequestEachPacketLength:)])
+                {
+                    expectLength = [self.delegate audioStreamingOperationRequestEachPacketLength:self];
+                }
+                
+                UInt8 bytes[expectLength];
                 CFIndex length;
                 
                 // 不读出来就不会继续
-                length = CFReadStreamRead(stream, bytes, 2048);
+                length = CFReadStreamRead(stream, bytes, expectLength);
                 
                 [self.delegate audioStreamingOperation:self didReadBytes:bytes length:length];
             }
@@ -202,11 +216,11 @@ static void readStreamCallBack(CFReadStreamRef aStream, CFStreamEventType eventT
             break;
         case kCFStreamEventEndEncountered:
         {
-            NSLog(@"stream event end.");
-            
-            [self.delegate audioStreamingOperationDidFinish:self];
+            TMNSLogInfo(@"stream event end.");
             
             [self cleanup];
+            
+            [self.delegate audioStreamingOperationDidFinish:self];
             
             _completed = YES;
         }
@@ -214,25 +228,22 @@ static void readStreamCallBack(CFReadStreamRef aStream, CFStreamEventType eventT
         case kCFStreamEventErrorOccurred:
         {
             CFStreamError error = CFReadStreamGetError(_stream);
-            NSLog(@"stream event error, code:%ld", error.error);
-            
-            if (error.domain == kCFStreamErrorDomainPOSIX && error.error == 54)
-            {
-                // 链接被重置，这个错误码意义和普通退出一样，不能识别为错误码
-                break;
-            }
+            TMNSLogError(@"Audio player CFStream event error, domain:%ld code:%ld", error.domain, error.error);
             
             [self cleanup];
             
             [self.delegate audioStreamingOperation:self failedWithError:[NSError errorWithDomain:@"com.tencent.weibo" code:error.error userInfo:nil]];
+            
+            _completed = YES;
         }
             break;
         default:
         {
-            NSLog(@"Unknown event type:%ld", eventType);
+            TMNSLogError(@"Unknown event type:%ld", eventType);
+            
+            _completed = YES;
         }
             break;
-            
     }
 }
 

@@ -15,14 +15,14 @@
 // Needs to be big enough to keep audio pipeline
 // busy (non-zero number of queued buffers) but
 // not so big that audio takes too long to begin
-// (kNumAQBufs * kAQBufSize of data must be
+// (kAQNumberOfBuffer * kAQDefaultBufSize of data must be
 // loaded before playback will start).
 //
 // Set LOG_QUEUED_BUFFERS to 1 to log how many
 // buffers are queued at any time -- if it drops
 // to zero too often, this value may need to
 // increase. Min 3, typical 8-24.
-#define kNumAQBufs 16			
+#define kAQNumberOfBuffer 16 //16
 
 // Number of bytes in each audio queue buffer
 // Needs to be big enough to hold a packet of
@@ -37,13 +37,13 @@
 #define kAQDefaultBufSize 2048	
 
 // Number of packet descriptions in our array
-#define kAQMaxPacketDescs 512
+#define kAQMaxPacketDescriptions 512
 
 enum {
     TMAudioPlayerStatusIdle = 0,
-    TMAudioPlayerStatusBuffering,
     TMAudioPlayerStatusPlaying,
-    TMAudioPlayerStatusPaused
+    TMAudioPlayerStatusPaused,
+    TMAudioPlayerStatusFinishing  // 正在结束中
 };
 typedef NSUInteger TMAudioPlayerStatus;
 
@@ -75,6 +75,7 @@ typedef NSUInteger TMAudioPlayerStatus;
 {
     // operation
     NSOperationQueue*            _operationQueue; // 执行数据流式下载的queue
+    BOOL                         _audioStreamingFinished; // 音频下载是否已经结束
     
     // url
     NSURL*                       _audioURL;
@@ -87,9 +88,13 @@ typedef NSUInteger TMAudioPlayerStatus;
     AudioStreamBasicDescription  _audioStremDescription; // 音频的一些属性描述
     
     // buffer相关变量
-    AudioQueueBufferRef          _audioQueueBuffer[kNumAQBufs]; // 音频队列中的buffer数组，buffer被作为一个循环队列填充/使用(播放)数据
-    bool                         _inuse[kNumAQBufs]; // 每个buffer的状态记录数组
+    AudioQueueBufferRef          _audioQueueBuffers[kAQNumberOfBuffer]; // 音频队列中的buffer数组，buffer被作为一个循环队列填充/使用(播放)数据
+    bool                         _bufferInuseFlags[kAQNumberOfBuffer]; // 每个buffer的状态记录数组
+    AudioStreamPacketDescription _packetDescriptions[kAQMaxPacketDescriptions];
+    unsigned int                 _fillingBufferIndex;
     NSInteger                    _buffersUsed; // 使用中的buffer个数
+    size_t                       _numberOfFilledBytes;
+    size_t                       _numberOfFilledPackets;
     
     pthread_mutex_t              _queueBuffersMutex; // 保护正在使用中buffer的互斥锁
 	pthread_cond_t               _queueBufferReadyCondition; // 条件变量，用于等待buffer状态变为可用
@@ -117,10 +122,10 @@ typedef NSUInteger TMAudioPlayerStatus;
 }
 
 #pragma mark - Interface
--(void)playAudioWithURL:(NSURL *)audioURL
+-(BOOL)playAudioWithURL:(NSURL *)audioURL
 {
     NSAssert([[audioURL absoluteString] length] > 0, @"Invalid audio url.");
-    if ([[audioURL absoluteString] length] == 0) return;
+    if ([[audioURL absoluteString] length] == 0) return NO;
     
     _audioURL = audioURL;
     
@@ -131,6 +136,7 @@ typedef NSUInteger TMAudioPlayerStatus;
     [self initializeAudioSession];
     
     // 2. start audio downloading
+    _audioStreamingFinished = NO;
     TMAudioStreamingOperation* streamOperation = [[TMAudioStreamingOperation alloc] initWithURL:audioURL];
     streamOperation.delegate = self;
     
@@ -140,50 +146,44 @@ typedef NSUInteger TMAudioPlayerStatus;
     
     // update status
     _status = TMAudioPlayerStatusPlaying;
+    
+    return YES;
 }
 
 -(void)stop
 {
-    @synchronized(self)
-    {
-        [self cleanupAudioStream];
-        
-        [self.delegate audioPlayerDidChangeStatus:self];
-    }
+    // 立即调用此方法，以防止queue的回调造成线程死锁
+    AudioQueueStop(_audioQueue, true);
+    
+    [self cleanupAudioStream];
+
+    [self.delegate audioPlayerDidChangeStatus:self];
 }
 
 -(void)pause
 {
-    @synchronized(self)
-    {
-        _status = TMAudioPlayerStatusPaused;
-        AudioQueuePause(_audioQueue);
-        
-        [self.delegate audioPlayerDidChangeStatus:self];
-    }
+    AudioQueuePause(_audioQueue);
+    
+    _status = TMAudioPlayerStatusPaused;
 }
 
 -(void)resume
 {
-    @synchronized(self)
+    OSStatus error = AudioSessionSetActive(true);
+    if (error)
     {
-        _status = TMAudioPlayerStatusPlaying;
-        if (AudioSessionSetActive(true))
-        {
-            // set active error
-            [self failedWithErrorCode:1];
-            return;
-        }
-        
-        if (AudioQueueStart(_audioQueue, NULL))
-        {
-            // start audio queue error
-//            [self failedWithErrorCode:1];
-            return;
-        }
-        
-        [self.delegate audioPlayerDidChangeStatus:self];
+        // set active error
+        [self failedWithErrorCode:error];
     }
+    
+    error = AudioQueueStart(_audioQueue, NULL);
+    if (error)
+    {
+        // start audio queue error
+        [self failedWithErrorCode:error];
+    }
+    
+    _status = TMAudioPlayerStatusPlaying;
 }
 
 -(BOOL)isPlaying
@@ -199,8 +199,20 @@ typedef NSUInteger TMAudioPlayerStatus;
 #pragma mark - Internal methods
 -(void)cleanupAudioStream
 {
+    if ([self isAudioQueueRunning])
+    {
+        // 立即停止，使所有queue相关回调不再触发
+        AudioQueueStop(_audioQueue, YES);
+    }
+    
+    // 释放锁
+    pthread_mutex_destroy(&_queueBuffersMutex);
+    pthread_cond_destroy(&_queueBufferReadyCondition);
+    
     @synchronized(self)
     {
+        _status = TMAudioPlayerStatusFinishing;
+        
         for (TMAudioStreamingOperation* operation in _operationQueue.operations)
         {
             operation.delegate = nil;
@@ -219,14 +231,27 @@ typedef NSUInteger TMAudioPlayerStatus;
         {
             AudioQueueDispose(_audioQueue, true);
             _audioQueue = nil;
+            
+            _fillingBufferIndex = 0;
+            _buffersUsed = 0;
+            _numberOfFilledBytes = 0;
+            _numberOfFilledPackets = 0;
+            
+            for (int i = 0; i != kAQNumberOfBuffer; i++)
+            {
+                _bufferInuseFlags[i] = false;
+            }
         }
         
-        // 释放锁
-        pthread_mutex_destroy(&_queueBuffersMutex);
-        pthread_cond_destroy(&_queueBufferReadyCondition);
-        
         // cleanup audio session
-        AudioSessionSetActive(false);
+        if (_audioSessionInitialized)
+        {
+            OSStatus error = AudioSessionSetActive(false);
+            if (error)
+            {
+                [self failedWithErrorCode:error];
+            }
+        }
         
         // reset iVars
         _status = TMAudioPlayerStatusIdle;
@@ -237,11 +262,12 @@ typedef NSUInteger TMAudioPlayerStatus;
 {
     if (!_audioSessionInitialized)
     {
-        if (AudioSessionInitialize(NULL,  NULL, tm_AudioSessionInterruptionListener, (__bridge void *)(self)))
+        OSStatus error = AudioSessionInitialize(NULL,  NULL, tm_AudioSessionInterruptionListener, (__bridge void *)(self));
+        if (error)
         {
             // audio session initialize error
-            [self failedWithErrorCode:1];
-            return;
+            [self failedWithErrorCode:error];
+//            return;
         }
         
         _audioSessionInitialized = YES;
@@ -251,13 +277,15 @@ typedef NSUInteger TMAudioPlayerStatus;
         
         // route change(如:耳机插拔)
         AudioSessionAddPropertyListener(kAudioSessionProperty_AudioRouteChange, tm_AudioSessionPropertyListener, (__bridge void *)(self));
+        AudioSessionAddPropertyListener(kAudioSessionProperty_ServerDied, tm_AudioSessionPropertyListener, (__bridge void *)(self));
     }
     
-    if (AudioSessionSetActive(true))
+    OSStatus error = AudioSessionSetActive(true);
+    if (error)
     {
         // set active error
-        [self failedWithErrorCode:1];
-        return;
+        [self failedWithErrorCode:error];
+//        return;
     }
     
     // initialize a mutex and condition so that we can block on buffers in use.
@@ -270,9 +298,11 @@ typedef NSUInteger TMAudioPlayerStatus;
     if (_audioQueue == nil)
     {
         // create queue
-        if (AudioQueueNewOutput(&_audioStremDescription, tm_AudioQueueOutputCallback, (__bridge void *)(self), NULL, NULL, 0, &_audioQueue))
+        OSStatus error = AudioQueueNewOutput(&_audioStremDescription, tm_AudioQueueOutputCallback, (__bridge void *)(self), NULL, NULL, 0, &_audioQueue);
+        if (error)
         {
-            [self failedWithErrorCode:1];
+            [self failedWithErrorCode:error];
+            [self stop];
             return;
         }
         
@@ -280,13 +310,14 @@ typedef NSUInteger TMAudioPlayerStatus;
         AudioQueueAddPropertyListener(_audioQueue, kAudioQueueProperty_IsRunning, tm_AudioQueueIsRunningCallback, (__bridge void *)(self));
         
         // allocate audio queue buffers
-        for (unsigned int i = 0; i < kNumAQBufs; ++i)
+        for (unsigned int i = 0; i < kAQNumberOfBuffer; ++i)
         {
-            if (AudioQueueAllocateBuffer(_audioQueue, kAQDefaultBufSize, &_audioQueueBuffer[i]))
+            OSStatus error = AudioQueueAllocateBuffer(_audioQueue, kAQDefaultBufSize, &_audioQueueBuffers[i]);
+            if (error)
             {
                 // alloc queue error
-                [self failedWithErrorCode:1];
-                return;
+                [self failedWithErrorCode:error];
+//                return;
             }
         }
     }
@@ -296,42 +327,75 @@ typedef NSUInteger TMAudioPlayerStatus;
 {
     if (_audioStream == nil)
     {
-        if(AudioFileStreamOpen((__bridge void *)(self), tm_AudioStreamPropertyListenerProc, tm_AudioStreamPacketsProc, kAudioFileMP3Type, &_audioStream))
+        OSStatus error = AudioFileStreamOpen((__bridge void *)(self), tm_AudioStreamPropertyListenerProc, tm_AudioStreamPacketsProc, kAudioFileMP3Type, &_audioStream);
+        if(error)
         {
             // open audio file stream error
-            [self failedWithErrorCode:1];
+            [self failedWithErrorCode:error];
+            [self stop];
+            
+            return;
         }
     }
 }
 
+-(BOOL)isAudioQueueRunning
+{
+    UInt32 isRunning = 0;
+    if (_audioQueue)
+    {
+        UInt32 ioDataSize = sizeof(isRunning);
+        AudioQueueGetProperty(_audioQueue, kAudioQueueProperty_IsRunning, &isRunning, &ioDataSize);
+    }
+    
+    return (isRunning > 0);
+}
+
 -(void)failedWithErrorCode:(NSInteger)errorCode
 {
-    [self cleanupAudioStream];
-    [self.delegate audioPlayer:self failedWithError:[NSError errorWithDomain:@"com.tencent" code:errorCode userInfo:nil]];
+    TMNSLogError(@"Audio player error:%d", errorCode);
+}
+
+// 当下载和播放都已结束时，结束掉audio queue，并通知状态更新
+-(void)finishAudioPlayingIfNecessary
+{
+    if (_audioStreamingFinished)
+    {
+        // 检查是否所有的buffer都已经处于空闲
+        for (int i = 0; i != kAQNumberOfBuffer; i++)
+        {
+            if (_bufferInuseFlags[i])
+            {
+                // 还有buffer处于使用中，
+                return;
+            }
+        }
+        
+        // 到这里说明所有buffer都为空，且下载流也已结束，可以结束播放了
+        [self stop];
+    }
 }
 
 #pragma mark - Enqueue Buffer
-- (void)enqueueBuffer
-{
-}
-
--(void)enqueueBufferAtIndex:(NSUInteger)index
-        numberOfFilledBytes:(NSUInteger)numberOfFilledBytes
-      numberOfFilledPackets:(NSUInteger)numberOfFilledPackets
-         packetDescriptions:(AudioStreamPacketDescription[])packetDescriptions
+-(void)enqueueBuffer
 {
 	@synchronized(self)
 	{
-		_inuse[index] = true;		// set in use flag
+        if (_status == TMAudioPlayerStatusFinishing)
+        {
+            return;
+        }
+        
+		_bufferInuseFlags[_fillingBufferIndex] = true;		// set in use flag
 		_buffersUsed++;
         
 		// enqueue buffer
-		AudioQueueBufferRef fillBuf = _audioQueueBuffer[index];
-		fillBuf->mAudioDataByteSize = numberOfFilledBytes;
+		AudioQueueBufferRef fillBuf = _audioQueueBuffers[_fillingBufferIndex];
+		fillBuf->mAudioDataByteSize = _numberOfFilledBytes;
 		
-		if (numberOfFilledPackets > 0)
+		if (_numberOfFilledPackets > 0)
 		{
-			AudioQueueEnqueueBuffer(_audioQueue, fillBuf, numberOfFilledPackets, packetDescriptions);
+			AudioQueueEnqueueBuffer(_audioQueue, fillBuf, _numberOfFilledPackets, _packetDescriptions);
 		}
 		else
 		{
@@ -339,26 +403,33 @@ typedef NSUInteger TMAudioPlayerStatus;
 		}
         
         // start queue
+        // TODO: 这里调用start的情况需要考虑
         if (_status != TMAudioPlayerStatusPaused)
         {
-            if (AudioQueueStart(_audioQueue, NULL))
+            if (![self isAudioQueueRunning])
             {
-                // 多次调用打开会返回错误码
-//                [self failedWithErrorCode:1];
-                return;
+                OSStatus error = AudioQueueStart(_audioQueue, NULL);
+                if (error)
+                {
+                    [self failedWithErrorCode:error];
+                }
             }
         }
         
 		// go to next buffer
-		if (++index >= kNumAQBufs)
+        if (++_fillingBufferIndex >= kAQNumberOfBuffer)
         {
-            index = 0;
+            // 回到第一个buffer
+            _fillingBufferIndex = 0;
         }
+        
+        _numberOfFilledBytes = 0;
+        _numberOfFilledPackets = 0;
 	}
     
-	// wait until next buffer is not in use
+	// 如果下一个buffer正在被使用，则等待知道下一个buffer空闲
 	pthread_mutex_lock(&_queueBuffersMutex);
-	while (_inuse[index])
+	while (_bufferInuseFlags[_fillingBufferIndex])
 	{
 		pthread_cond_wait(&_queueBufferReadyCondition, &_queueBuffersMutex);
 	}
@@ -374,16 +445,28 @@ static void tm_AudioSessionInterruptionListener(void *inClientData, UInt32 inInt
 
 - (void)handleInterruptionChangeToState:(AudioQueuePropertyID)inInterruptionState
 {
-    @synchronized(self)
+    // 因为这个回调总是在主线程，所以为了防止主线程被挂起，在线程中执行操作
+    if (inInterruptionState == kAudioSessionBeginInterruption)
     {
-        if (inInterruptionState == kAudioSessionBeginInterruption)
+        if ([self isPlaying] || [self isPaused])
         {
-            [self pause];
+            [self stop];
         }
-        else if (inInterruptionState == kAudioSessionEndInterruption)
-        {
-            [self resume];
-        }
+    }
+    else if (inInterruptionState == kAudioSessionEndInterruption)
+    {
+        // 因为所有中断都停止播放，所以就不需要恢复了
+//        UInt32 shouldResume;
+//        UInt32 flagSize = sizeof(shouldResume);
+//        AudioSessionGetProperty(kAudioSessionProperty_InterruptionType, &flagSize, &shouldResume);
+//        if (shouldResume == kAudioSessionInterruptionType_ShouldResume)
+//        {
+//            [self resume];
+//        }
+//        else
+//        {
+//            TMNSLogInfo(@"Interrupt end, but should not resume.");
+//        }
     }
 }
 
@@ -397,28 +480,39 @@ static void tm_AudioSessionPropertyListener(void* inClientData, AudioSessionProp
                                        inDataSize:(UInt32)inDataSize
                                            inData:(const void *)inData
 {
-    if (inID == kAudioSessionProperty_AudioRouteChange)
+    switch (inID)
     {
-        CFDictionaryRef routeChangeDictionary = inData;
-        CFNumberRef routeChangeReasonRef = CFDictionaryGetValue (routeChangeDictionary, CFSTR(kAudioSession_AudioRouteChangeKey_Reason));
-        SInt32 routeChangeReason;
-        CFNumberGetValue(routeChangeReasonRef, kCFNumberSInt32Type, &routeChangeReason);
-        
-        if (routeChangeReason == kAudioSessionRouteChangeReason_OldDeviceUnavailable
-            || routeChangeReason == kAudioSessionRouteChangeReason_NewDeviceAvailable)
+        case kAudioSessionProperty_AudioRouteChange:
         {
-            CFStringRef route;
-            UInt32 propertySize = sizeof(CFStringRef);
-            if (AudioSessionGetProperty(kAudioSessionProperty_AudioRoute, &propertySize, &route) == 0)
+            CFDictionaryRef routeChangeDictionary = inData;
+            CFNumberRef routeChangeReasonRef = CFDictionaryGetValue (routeChangeDictionary, CFSTR(kAudioSession_AudioRouteChangeKey_Reason));
+            SInt32 routeChangeReason;
+            CFNumberGetValue(routeChangeReasonRef, kCFNumberSInt32Type, &routeChangeReason);
+            
+            if (routeChangeReason == kAudioSessionRouteChangeReason_OldDeviceUnavailable
+                || routeChangeReason == kAudioSessionRouteChangeReason_NewDeviceAvailable)
             {
-                NSString *routeString = (__bridge NSString *) route;
-                if ([routeString isEqualToString: @"Headphone"] == NO)
+                CFStringRef route;
+                UInt32 propertySize = sizeof(CFStringRef);
+                if (AudioSessionGetProperty(kAudioSessionProperty_AudioRoute, &propertySize, &route) == 0)
                 {
-                    // 拔出耳机
-                    [self pause];
+                    NSString *routeString = (__bridge NSString *) route;
+                    if ([routeString isEqualToString: @"Headphone"] == NO)
+                    {
+                        // 拔出耳机
+                        [self stop];
+                    }
                 }
             }
         }
+            break;
+        case kAudioSessionProperty_ServerDied:
+        {
+            TMNSLogError(@"Music server has died.");
+            [self failedWithErrorCode:'died'];
+            [self stop];
+        }
+            break;
     }
 }
 
@@ -488,42 +582,20 @@ static void tm_AudioStreamPacketsProc(void* inClientData,
         [self setupAudioQueue];
     }
     
-    static NSUInteger fillingBufferIndex = 0;
-    static size_t bytesFilled = 0; // 这个包已被添加到buffer里的字节数
-    
     // 如果有描述信息，表示使用的是VBR(动态比特率)，否则是CBR(固定比特率)
     if (inPacketDescriptions)
     {
-        static size_t packetsFilled = 0; // 已被添加到buffer的包数
-        AudioStreamPacketDescription packetDescs[kAQMaxPacketDescs];
-        
         for (int i = 0; i < inNumberPackets; ++i)
 		{
 			SInt64 packetOffset = inPacketDescriptions[i].mStartOffset;
 			SInt64 packetSize   = inPacketDescriptions[i].mDataByteSize;
-			size_t bufSpaceRemaining = kAQDefaultBufSize - bytesFilled;
+			size_t bufSpaceRemaining = kAQDefaultBufSize - _numberOfFilledBytes;
             
 			// 当前buffer已经不能包含完整个包，就入队(enqueue)，将该包放入下一个buffer
             // 否则，继续将包拷贝到当前buffer中
 			if (bufSpaceRemaining < packetSize)
 			{
-                [self enqueueBufferAtIndex:fillingBufferIndex
-                       numberOfFilledBytes:bytesFilled
-                     numberOfFilledPackets:packetsFilled
-                        packetDescriptions:packetDescs];
-                
-                // 向下一个buffer填充数据
-                // TODO: 如果下一个buffer还没有播放完，如何处理呢？应该让readStream停止
-                ++fillingBufferIndex;
-                
-                if (fillingBufferIndex >= kNumAQBufs)
-                {
-                    // 回到第一个buffer
-                    fillingBufferIndex = 0;
-                }
-                
-                bytesFilled = 0;
-                packetsFilled = 0;
+                [self enqueueBuffer];
 			}
 			
 			@synchronized(self)
@@ -532,43 +604,29 @@ static void tm_AudioStreamPacketsProc(void* inClientData,
 				// If there was some kind of issue with enqueueBuffer and we didn't
 				// make space for the new audio data then back out
 				//
-				if (bytesFilled + packetSize > kAQDefaultBufSize)
+				if (_numberOfFilledBytes + packetSize > kAQDefaultBufSize)
 				{
 					return;
 				}
 				
 				// 当前包放入当前buffer
-				AudioQueueBufferRef fillBuf = _audioQueueBuffer[fillingBufferIndex];
-				memcpy((char*)fillBuf->mAudioData + bytesFilled, (const char*)inInputData + packetOffset, packetSize);
+				AudioQueueBufferRef fillBuf = _audioQueueBuffers[_fillingBufferIndex];
+				memcpy((char*)fillBuf->mAudioData + _numberOfFilledBytes, (const char*)inInputData + packetOffset, packetSize);
                 
 				// fill out packet description
-				packetDescs[packetsFilled] = inPacketDescriptions[i];
-				packetDescs[packetsFilled].mStartOffset = bytesFilled;
+				_packetDescriptions[_numberOfFilledPackets] = inPacketDescriptions[i];
+				_packetDescriptions[_numberOfFilledPackets].mStartOffset = _numberOfFilledBytes;
                 
 				// keep track of bytes filled and packets filled
-				bytesFilled += packetSize;
-				packetsFilled += 1;
+				_numberOfFilledBytes += packetSize;
+				_numberOfFilledPackets += 1;
 			}
 			
 			// if that was the last free packet description, then enqueue the buffer.
-			size_t packetsDescsRemaining = kAQMaxPacketDescs - packetsFilled;
+			size_t packetsDescsRemaining = kAQMaxPacketDescriptions - _numberOfFilledPackets;
 			if (packetsDescsRemaining == 0)
             {
-                [self enqueueBufferAtIndex:fillingBufferIndex
-                       numberOfFilledBytes:bytesFilled
-                     numberOfFilledPackets:packetsFilled
-                        packetDescriptions:packetDescs];
-                
-                ++fillingBufferIndex;
-                
-                if (fillingBufferIndex >= kNumAQBufs)
-                {
-                    // 回到第一个buffer
-                    fillingBufferIndex = 0;
-                }
-                
-                bytesFilled = 0;
-                packetsFilled = 0;
+                [self enqueueBuffer];
 			}
 		}
     }
@@ -578,29 +636,15 @@ static void tm_AudioStreamPacketsProc(void* inClientData,
 		while (inNumberBytes > 0)
 		{
 			// 如果当前buffer没有足够空间，则将buffer放入queue队列，然后填充下一个buffer
-			size_t bufSpaceRemaining = kAQDefaultBufSize - bytesFilled;
+			size_t bufSpaceRemaining = kAQDefaultBufSize - _numberOfFilledBytes;
 			if (bufSpaceRemaining < inNumberBytes)
 			{
-                [self enqueueBufferAtIndex:fillingBufferIndex
-                       numberOfFilledBytes:bytesFilled
-                     numberOfFilledPackets:0
-                        packetDescriptions:NULL];
-                
-                // 下一个buffer
-                ++fillingBufferIndex;
-                
-                if (fillingBufferIndex >= kNumAQBufs)
-                {
-                    // 回到第一个buffer
-                    fillingBufferIndex = 0;
-                }
-                
-                bytesFilled = 0;
+                [self enqueueBuffer];
 			}
 			
 			@synchronized(self)
 			{
-				bufSpaceRemaining = kAQDefaultBufSize - bytesFilled;
+				bufSpaceRemaining = kAQDefaultBufSize - _numberOfFilledBytes;
 				size_t copySize;
 				if (bufSpaceRemaining < inNumberBytes)
 				{
@@ -615,16 +659,17 @@ static void tm_AudioStreamPacketsProc(void* inClientData,
 				// If there was some kind of issue with enqueueBuffer and we didn't
 				// make space for the new audio data then back out
 				//
-				if (bytesFilled > kAQDefaultBufSize)
+				if (_numberOfFilledBytes > kAQDefaultBufSize)
 				{
 					return;
 				}
 				
 				// copy data to the audio queue buffer
-				AudioQueueBufferRef fillBuf = _audioQueueBuffer[fillingBufferIndex];
-				memcpy((char*)fillBuf->mAudioData + bytesFilled, (const char*)(inInputData + offset), copySize);
+				AudioQueueBufferRef fillBuf = _audioQueueBuffers[_fillingBufferIndex];
+				memcpy((char*)fillBuf->mAudioData + _numberOfFilledBytes, (const char*)(inInputData + offset), copySize);
                 
-				bytesFilled += copySize;
+				_numberOfFilledBytes += copySize;
+                _numberOfFilledPackets = 0;
 				inNumberBytes -= copySize;
 				offset += copySize;
 			}
@@ -644,9 +689,9 @@ static void tm_AudioQueueOutputCallback(void* inClientData,
 - (void)handleBufferCompleteForQueue:(AudioQueueRef)inAQ buffer:(AudioQueueBufferRef)inBuffer
 {
     unsigned int bufIndex = -1;
-	for (unsigned int i = 0; i < kNumAQBufs; ++i)
+	for (unsigned int i = 0; i < kAQNumberOfBuffer; ++i)
 	{
-		if (inBuffer == _audioQueueBuffer[i])
+		if (inBuffer == _audioQueueBuffers[i])
 		{
 			bufIndex = i;
 			break;
@@ -658,16 +703,21 @@ static void tm_AudioQueueOutputCallback(void* inClientData,
 		pthread_mutex_lock(&_queueBuffersMutex);
 		pthread_cond_signal(&_queueBufferReadyCondition);
 		pthread_mutex_unlock(&_queueBuffersMutex);
+        
+        [self finishAudioPlayingIfNecessary];
+        
 		return;
 	}
 
 	// signal waiting thread that the buffer is free.
 	pthread_mutex_lock(&_queueBuffersMutex);
-	_inuse[bufIndex] = false;
+	_bufferInuseFlags[bufIndex] = false;
 	_buffersUsed--;
     
     pthread_cond_signal(&_queueBufferReadyCondition);
 	pthread_mutex_unlock(&_queueBuffersMutex);
+    
+    [self finishAudioPlayingIfNecessary];
 }
 
 static void tm_AudioQueueIsRunningCallback(void *inUserData, AudioQueueRef inAQ, AudioQueuePropertyID inID)
@@ -702,7 +752,7 @@ static void tm_AudioQueueIsRunningCallback(void *inUserData, AudioQueueRef inAQ,
 #pragma mark - TMAudioStreamingOperationDelegate
 -(BOOL)shouldAudioStreamingOperationContinueReading:(TMAudioStreamingOperation *)aso
 {
-    return (_status != TMAudioPlayerStatusPaused);
+    return (_status != TMAudioPlayerStatusPaused && _status != TMAudioPlayerStatusFinishing);
 }
 
 -(void)audioStreamingOperation:(TMAudioStreamingOperation *)aso didReadBytes:(unsigned char*)bytes length:(long long)length
@@ -728,12 +778,20 @@ static void tm_AudioQueueIsRunningCallback(void *inUserData, AudioQueueRef inAQ,
 
 -(void)audioStreamingOperation:(TMAudioStreamingOperation *)aso failedWithError:(NSError*)error
 {
-    [self failedWithErrorCode:1];
+    [self failedWithErrorCode:error];
+    
+    [self stop];
 }
 
 -(void)audioStreamingOperationDidFinish:(TMAudioStreamingOperation *)aso
 {
-    [self stop];
+    _audioStreamingFinished = YES;
+//    [self stop];
+}
+
+-(long)audioStreamingOperationRequestEachPacketLength:(TMAudioStreamingOperation *)aso
+{
+    return kAQDefaultBufSize;
 }
 
 @end
